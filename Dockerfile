@@ -1,13 +1,26 @@
 # ─── Stage 1: Dependencies ───────────────────────────────────────────────────
-FROM node:22-alpine AS deps
+# node:22-bookworm-slim = Debian 12 (glibc) — required for Next.js SWC binaries on Linux
+FROM node:22-bookworm-slim AS deps
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
-RUN npm ci --frozen-lockfile
+# Patch OS-level CVEs before anything else
+RUN apt-get update && \
+    apt-get upgrade -y --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY .npmrc package.json package-lock.json* ./
+# npm ci uses the lockfile for reproducible installs.
+# npm v7+ lockfiles include optional deps for all platforms; npm selects
+# the correct linux-x64-gnu SWC binary automatically at install time.
+RUN npm ci
 
 # ─── Stage 2: Builder ────────────────────────────────────────────────────────
-FROM node:22-alpine AS builder
+FROM node:22-bookworm-slim AS builder
 WORKDIR /app
+
+RUN apt-get update && \
+    apt-get upgrade -y --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -17,25 +30,26 @@ ENV NODE_ENV=production
 
 RUN npm run build
 
-# ─── Stage 3: Production runner ──────────────────────────────────────────────
-FROM node:22-alpine AS runner
+# Ensure public/ always exists so the COPY in the runner stage never fails
+RUN mkdir -p /app/public
+
+# ─── Stage 3: Production runner (Distroless) ─────────────────────────────────
+# Pinned by digest for reproducible, auditable builds.
+# To update: docker pull gcr.io/distroless/nodejs22-debian12 && docker inspect --format='{{index .RepoDigests 0}}' gcr.io/distroless/nodejs22-debian12
+FROM gcr.io/distroless/nodejs22-debian12@sha256:8a3e96fe3345b5d83ecec2066e7c498139a02a6d1214e4f6c39f9ce359f3f5bc AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
-
-RUN addgroup --system --gid 1001 nodejs && \
-    adduser  --system --uid 1001 nextjs
-
-# Copy only what's needed for standalone output
-COPY --from=builder /app/public           ./public
-COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
-COPY --from=builder --chown=nextjs:nodejs /app/.next/static     ./.next/static
-
-USER nextjs
-
-EXPOSE 3000
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 
-CMD ["node", "server.js"]
+# Copy only the standalone output from the builder
+COPY --from=builder /app/public           ./public
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static     ./.next/static
+
+EXPOSE 3000
+
+# Distroless has no shell — CMD must be exec form with full node path
+CMD ["server.js"]
